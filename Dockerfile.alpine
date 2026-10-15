@@ -1,0 +1,153 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+# bash runs the test suite.
+RUN apk add --no-cache \
+      autoconf \
+      automake \
+      bash \
+      brotli-dev \
+      build-base \
+      bzip2-dev \
+      bzip3-dev \
+      ca-certificates \
+      git \
+      linux-headers \
+      lz4-dev \
+      pcre2-dev \
+      pkgconf \
+      scanelf \
+      xz-dev \
+      zlib-dev \
+      zstd-dev
+
+# ugrep attaches only a Windows build to its releases and does not sign its
+# tags, so the release tag is cloned and must point to the commit pinned in
+# package.yml. The prebuilt Windows programs in bin/ are deleted.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
+      https://github.com/Genivia/ugrep.git /src/ugrep; \
+    test "$(git -C /src/ugrep rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    grep -Fqx "#define UGREP_VERSION \"${VERSION}\"" /src/ugrep/src/ugrep.hpp \
+      || { echo "src/ugrep.hpp does not set version ${VERSION}" >&2; exit 1; }; \
+    rm -rf /src/ugrep/bin/win32 /src/ugrep/bin/win64
+
+# autoreconf writes the generated build files in the tree again: a clone
+# gives every file the same time stamp, after which make may try to rerun
+# automake. configure skips a compression library it cannot find, without
+# failing, so config.h must define each one. AVX-512 is not built, because
+# configure decides it by running a test program on the build machine. The
+# SSE2 code and the AVX2 code, which ugrep picks at run time, stay. The shell
+# completions are not installed.
+ARG JOBS
+WORKDIR /src/ugrep
+RUN set -- \
+      --prefix=/usr/local \
+      --with-bzip3 \
+      --disable-avx512 \
+      --without-bash-completion-dir \
+      --without-fish-completion-dir \
+      --without-zsh-completion-dir; \
+    autoreconf -fi; \
+    ./configure "$@"; \
+    echo "configure: $*" > /tmp/configure-options; \
+    for d in HAVE_PCRE2 HAVE_LIBZ HAVE_LIBBZ2 HAVE_LIBLZMA HAVE_LIBLZ4 HAVE_LIBZSTD HAVE_LIBBROTLI HAVE_LIBBZIP3 HAVE_7ZIP; do \
+      grep -qx "#define ${d} 1" config.h || { echo "configure did not define ${d}" >&2; exit 1; }; \
+    done; \
+    case "$(uname -m)" in \
+      x86_64) simd='-msse2 -DHAVE_AVX2' ;; \
+      aarch64) simd='-DHAVE_NEON' ;; \
+      *) echo "unexpected machine: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    grep -qx "SIMD_FLAGS = ${simd}" lib/Makefile || { grep '^SIMD' lib/Makefile >&2; exit 1; }; \
+    if grep -q -e '-mavx512' lib/Makefile; then echo "AVX-512 code is built" >&2; exit 1; fi; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make test; \
+    make install-strip DESTDIR=/out; \
+    rm -rf /out/usr/local/share/man
+
+ARG BASE_IMAGE
+# ug is a copy of ugrep that reads a .ugrep configuration file; ug+ and
+# ugrep+ are shell scripts that add filters for the PDF, document and image
+# tools they find. The license of the LZW decoder is cut from the comment of
+# its source, and the LZMA SDK's README says it is in the public domain.
+# licenses/ holds the Unicode License v3, which covers the Unicode tables in
+# RE/flex; the source tree has no copy of it.
+# runtime-deps lists the so: names the programs need, plus the packages in
+# runtime-deps.alpine.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    --mount=type=bind,source=licenses,target=/tmp/licenses.extra \
+    usr=/out/usr/local; \
+    for f in "$usr"/bin/*; do echo "${f##*/}"; done | LC_ALL=C sort > /tmp/programs; \
+    printf '%s\n' ug ug+ ugrep ugrep+ ugrep-indexer | cmp -s - /tmp/programs \
+      || { echo "unexpected programs:" >&2; cat /tmp/programs >&2; exit 1; }; \
+    cmp "$usr/bin/ugrep" "$usr/bin/ug"; \
+    for f in ug+ ugrep+; do test "$(head -n 1 "$usr/bin/$f")" = '#!/bin/sh'; done; \
+    test -s "$usr/share/ugrep/patterns/c/includes"; \
+    test "$(ls "$usr/share")" = ugrep || { ls "$usr/share" >&2; exit 1; }; \
+    readelf -d "$usr/bin/ugrep" > /tmp/dynamic; \
+    for lib in libpcre2-8 libz libbz2 liblzma liblz4 libzstd libbrotlidec libbzip3; do \
+      grep -q "Shared library: \[${lib}\.so" /tmp/dynamic \
+        || { echo "ugrep does not load ${lib}" >&2; cat /tmp/dynamic >&2; exit 1; }; \
+    done; \
+    "$usr/bin/ugrep" --version > /tmp/ugrep-version; \
+    head -n 1 /tmp/ugrep-version \
+      | grep -Fq "; -P:pcre2jit; -z:zlib,bzip2,lzma,lz4,zstd,brotli,bzip3,7z,tar/pax/cpio/zip" \
+      || { cat /tmp/ugrep-version >&2; exit 1; }; \
+    case "$(head -n 1 /tmp/ugrep-version)" in \
+      "ugrep ${VERSION} "*) ;; \
+      *) cat /tmp/ugrep-version >&2; exit 1 ;; \
+    esac; \
+    meta="$usr/share/randomcontainers/ugrep"; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE.txt "$meta/licenses/LICENSE.txt"; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Regents of the University of California/) { printf "%s", b; exit } }' \
+      src/zopen.c > "$meta/licenses/LICENSE.zopen"; \
+    grep -q 'Redistribution and use in source and binary forms' "$meta/licenses/LICENSE.zopen"; \
+    cp lzma/C/README.txt "$meta/licenses/README.lzma-sdk"; \
+    grep -q 'LZMA SDK is placed in the public domain' "$meta/licenses/README.lzma-sdk"; \
+    cp /tmp/licenses.extra/Unicode-3.0 "$meta/licenses/Unicode-3.0"; \
+    grep -q 'UNICODE LICENSE V3' "$meta/licenses/Unicode-3.0"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/Genivia/ugrep.git@${SOURCE_COMMIT}" \
+      "https://github.com/Genivia/ugrep/tree/${SOURCE_COMMIT}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | head -n 1)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      cat /tmp/configure-options; \
+      grep -E '^(PLATFORM|SIMD_FLAGS|SIMD_AVX2_FLAGS) =' lib/Makefile; \
+      head -n 1 /tmp/ugrep-version; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | LC_ALL=C sort -u > /tmp/needed; \
+    grep -q '^libbzip3\.so\.' /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/ugrep/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "ugrep"]
+CMD ["--help"]
