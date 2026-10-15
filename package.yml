@@ -1,0 +1,234 @@
+name: ugrep
+title: ugrep
+summary: Searches files, archives and compressed files with regular expressions, Boolean queries and fuzzy matching, and indexes large trees for faster searches.
+homepage: https://ugrep.com/
+# ugrep and the RE/flex library compiled into it (BSD-3-Clause), the LZW
+# decoder for .Z files from the University of California (BSD-3-Clause), the
+# 7z decoder from the LZMA SDK (public domain) and the Unicode tables in
+# RE/flex, generated from the Unicode Character Database (Unicode-3.0).
+license: BSD-3-Clause AND LicenseRef-Public-Domain AND Unicode-3.0
+upstream:
+  source: github-release
+  repository: Genivia/ugrep
+  # Release tags look like v7.8.5; development tags such as v7.1.6-(dev) do
+  # not match.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 7.8.5
+  # The releases carry only a Windows build and the tags are not signed, so
+  # the build clones the tag and checks that it is this commit.
+  git:
+    url: https://github.com/Genivia/ugrep.git
+    tag: v{version}
+    commit: f2cc252c011460f6c75b1fb591813b4b6b59c225
+image:
+  entrypoint: [ugrep]
+  cmd: [--help]
+test:
+  - |
+    ugrep --version > version.txt
+    # The SIMD extension is the best one the CPU has: AVX-512 is not built.
+    case "$(uname -m)" in
+      x86_64) simd='\+(sse2|avx2)' ;;
+      aarch64) simd='\+neon/AArch64' ;;
+      *) echo "unexpected machine: $(uname -m)" >&2; exit 1 ;;
+    esac
+    v="$(printf '%s' "$VERSION" | sed 's/\./\\./g')"
+    triplet="$(uname -m)-[a-z]+-linux-(gnu|musl)"
+    features='-P:pcre2jit; -z:zlib,bzip2,lzma,lz4,zstd,brotli,bzip3,7z,tar/pax/cpio/zip'
+    if ! head -n 1 version.txt | grep -Eqx "ugrep $v $triplet $simd; $features"; then
+      cat version.txt >&2
+      exit 1
+    fi
+    ug --version > ug-version.txt
+    cmp version.txt ug-version.txt || { cat ug-version.txt >&2; exit 1; }
+    ugrep-indexer --version > indexer-version.txt
+    if ! head -n 1 indexer-version.txt | grep -Eqx "ugrep-indexer $v $triplet"; then
+      cat indexer-version.txt >&2
+      exit 1
+    fi
+    for tool in ug+ ugrep+; do
+      command -v "$tool" > /dev/null || { echo "missing: $tool" >&2; exit 1; }
+    done
+  - |
+    check() {
+      if [ "$1" != "$2" ]; then printf 'expected "%s", got "%s"\n' "$2" "$1" >&2; exit 1; fi
+    }
+    mkdir -p docs/sub
+    printf 'alpha\nbeta one\ngamma\n' > docs/a.txt
+    printf 'Beta two\nhello world\n' > docs/sub/b.txt
+    printf 'beta in a log\n' > docs/c.log
+    ugrep -rin --include='*.txt' beta docs | LC_ALL=C sort > found.txt
+    printf 'docs/a.txt:2:beta one\ndocs/sub/b.txt:1:Beta two\n' > expected.txt
+    cmp expected.txt found.txt || { cat found.txt >&2; exit 1; }
+    check "$(printf 'x\ny\ny\n' | ugrep -c y)" 2
+    check "$(printf 'foobar\nbazbar\n' | ugrep -P '(?<=foo)bar')" foobar
+    check "$(printf 'helo world\ngoodbye\n' | ugrep -Z1 hello)" 'helo world'
+    check "$(printf 'red apple\ngreen apple\nred pear\n' | ugrep --bool 'apple -green')" 'red apple'
+    ugrep --json -Hn beta docs/a.txt > json.txt
+    if ! grep -Fq '"file": "docs/a.txt"' json.txt || ! grep -Fq '{ "line": 2, "match": "beta one" }' json.txt; then
+      cat json.txt >&2
+      exit 1
+    fi
+    # A filter runs a program on each file it applies to. ug+ adds filters
+    # only for the tools it finds, so here it searches the file as it is.
+    check "$(ugrep --filter='txt:tr a-z A-Z' -c 'BETA ONE' docs/a.txt)" 1
+    check "$(ug+ -c beta docs/a.txt)" 1
+    # Pattern files are looked up in /usr/local/share/ugrep/patterns.
+    printf '#include <stdio.h>\nint main(void) { return 0; }\n' > main.c
+    check "$(ugrep -f c/includes main.c)" '#include <stdio.h>'
+  - |
+    mkdir -p src/sub
+    printf 'first needle\n' > src/one.txt
+    printf 'no match here\nsecond needle\n' > src/sub/two.txt
+    printf 'needle in gzip\n' > single.txt
+    gzip -c single.txt > single.txt.gz
+    ugrep -z -c needle single.txt.gz > gz.txt || { cat gz.txt >&2; exit 1; }
+    test "$(cat gz.txt)" = 1 || { cat gz.txt >&2; exit 1; }
+    tar -czf bundle.tgz src/one.txt src/sub/two.txt
+    ugrep -z -c needle bundle.tgz | LC_ALL=C sort > tgz.txt
+    printf 'bundle.tgz{src/one.txt}:1\nbundle.tgz{src/sub/two.txt}:1\n' > expected.txt
+    cmp expected.txt tgz.txt || { cat tgz.txt >&2; exit 1; }
+  - |
+    # Files in formats the base images cannot write. Each holds the line
+    # "needle in <format>" and a line of filler, so that the codecs compress.
+    # note.bz3 is one bzip3 block of less than 64 bytes, which bzip3 stores
+    # as a CRC-32C, -1 and the bytes themselves.
+    b64() { base64 -d > "$1"; }
+    b64 bundle.7z <<'EOF'
+    N3q8ryccAANT2wRhJgAAAAAAAABrAAAAAAAAADH74EXgARsAHl0ANxlsyG7XOO1gu5Zbxsk/+Ha3
+    TdnA04lwi83eRqQAAAEEBgABCSYABwsBAAEhIQEWDIEcAAgKAcqjH6oAAAUBERsAbgBvAHQAZQBz
+    AC8ANwB6AC4AdAB4AHQAAAAUCgEA7ZwLqkVc3QESCgEA7ZwLqkVc3QETCgEAwJELqkVc3QEVBgEA
+    IICkgQAA
+    EOF
+    b64 bundle.zip <<'EOF'
+    UEsDBBQAAgAIAJwMT12yceRMHQAAAB0BAAANAAAAbm90ZXMvemlwLnR4dMtLTU3JSVXIzFOoyizg
+    ykisLC5JTM5WGGUAGVwAUEsBAh4DFAACAAgAnAxPXbJx5EwdAAAAHQEAAA0AAAAAAAAAAQAAAKSB
+    AAAAAG5vdGVzL3ppcC50eHRQSwUGAAAAAAEAAQA7AAAASAAAAAAA
+    EOF
+    b64 note.Z <<'EOF'
+    H52QbsqUIcOmDIg0bkCMedMGjpwyc+YoQBMmzxw6YcasAUHRIkaNHCtezLix40iQJj+WFKkypEeS
+    Lk+ufImSJcyUN23WpDlTZsyWOHf6DNoTqM6iOXn+TDr06FKhRpUSfbpRAQ==
+    EOF
+    b64 note.br <<'EOF'
+    Gx8B+EVP1l/Sc/3MxphC0YIoYsuAkoE2VqK0M4dXdH+dCP2erEgA
+    EOF
+    b64 note.bz2 <<'EOF'
+    QlpoOTFBWSZTWUrECpkAAGFZgAAQQAAQAD5tTDAgAEDeqkAGE0KaZGJiYmmnlaId2xBWDjuDe9Ot
+    kPKZtBfG9MwZg9gz+LuSKcKEglYgVMg=
+    EOF
+    b64 note.bz3 <<'EOF'
+    QlozdjEAABAAGAAAABAAAAASv75V/////25lZWRsZSBpbiBiemlwMwo=
+    EOF
+    b64 note.lz4 <<'EOF'
+    BCJNGGRApyIAAAD/CG5lZWRsZSBpbiBsejQKaGF5c3RhY2sgCQDuUGFjayAKAAAAAMSWqF8=
+    EOF
+    b64 note.xz <<'EOF'
+    /Td6WFoAAATm1rRGA8AmnAIhAQAAAAAAohyzI+ABGwAeXQA3GWzIbtc47WC7mTqs1TFrs/SjQzix
+    yIGE8m68gAAAAABAaEKaPRQerQABPpwCAAAAmrDaQ7HEZ/sCAAAAAARZWg==
+    EOF
+    b64 note.zst <<'EOF'
+    KLUv/QRoBQEAyG5lZWRsZSBpbiB6c3RkCmhheXN0YWNrIAoBAAhQLWPawoJT
+    EOF
+    ugrep -z -o 'needle in [0-9a-z]+' bundle.7z bundle.zip note.Z note.br note.bz2 note.bz3 note.lz4 note.xz note.zst \
+      | LC_ALL=C sort > found.txt
+    printf '%s\n' \
+      'bundle.7z{notes/7z.txt}:needle in 7z' \
+      'bundle.zip{notes/zip.txt}:needle in zip' \
+      'note.Z:needle in compress' \
+      'note.br:needle in brotli' \
+      'note.bz2:needle in bzip2' \
+      'note.bz3:needle in bzip3' \
+      'note.lz4:needle in lz4' \
+      'note.xz:needle in xz' \
+      'note.zst:needle in zstd' \
+      > expected.txt
+    cmp expected.txt found.txt || { cat found.txt >&2; exit 1; }
+  - |
+    # ugrep-indexer writes a hidden index file into each directory, and
+    # ugrep --index skips the files whose index rules out a match: here
+    # tree/b.txt, which does not contain the letter b.
+    mkdir -p tree/sub
+    printf 'alpha\nbeta\n' > tree/a.txt
+    printf 'gamma\n' > tree/b.txt
+    printf 'beta again\n' > tree/sub/c.txt
+    ugrep-indexer -q tree
+    for d in tree tree/sub; do
+      test -s "$d/._UG#_Store" || { echo "no index file in $d" >&2; exit 1; }
+    done
+    ugrep --index -l beta tree | LC_ALL=C sort > indexed.txt
+    printf 'tree/a.txt\ntree/sub/c.txt\n' > expected.txt
+    cmp expected.txt indexed.txt || { cat indexed.txt >&2; exit 1; }
+    ugrep --index --stats -l beta tree > stats.txt
+    grep -Eq '^Skipped 1 file of [0-9]+ .* not matching [1-9][0-9]* indexes$' stats.txt \
+      || { cat stats.txt >&2; exit 1; }
+    ugrep-indexer -d -q tree
+    if [ -e 'tree/._UG#_Store' ]; then echo "ugrep-indexer -d left the index file" >&2; exit 1; fi
+examples:
+  - title: Search the files in the current directory and below, with line numbers
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/ugrep -rn 'TODO' .
+  - title: List the files in archives and compressed files that contain a word
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/ugrep -z -rlw 'invoice' backups
+  - title: Search the text of PDF files and other files with ugrep+ (default image)
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint ugrep+ ghcr.io/randomcontainers/ugrep -rn 'net 30' .
+  - title: Find lines that contain both words, in any order, and not a third
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/ugrep -rn --bool 'error timeout -retry' logs
+combos:
+  - with: [poppler]
+    default: true
+    base: poppler
+    summary: ugrep with Poppler, so that ug+ and ugrep+ search the text of PDF files through pdftotext.
+    test:
+      - |
+        check() {
+          if [ "$1" != "$2" ]; then printf 'expected "%s", got "%s"\n' "$2" "$1" >&2; exit 1; fi
+        }
+        # pdf FILE OBJECT...: object 1 is the catalog; the offsets in the
+        # cross-reference table are exact.
+        pdf() {
+          out="$1"
+          shift
+          printf '%%PDF-1.7\n' > "$out"
+          : > offsets.txt
+          n=0
+          for obj in "$@"; do
+            n=$((n + 1))
+            wc -c < "$out" >> offsets.txt
+            printf '%d 0 obj\n%s\nendobj\n' "$n" "$obj" >> "$out"
+          done
+          start="$(wc -c < "$out")"
+          {
+            printf 'xref\n0 %d\n0000000000 65535 f \n' "$((n + 1))"
+            while read -r offset; do printf '%010d 00000 n \n' "$offset"; done < offsets.txt
+            printf 'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' "$((n + 1))" "$start"
+          } >> "$out"
+        }
+        stream() {
+          printf '<< /Length %d >>\nstream\n%s\nendstream' "${#1}" "$1"
+        }
+        page() {
+          printf '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Resources << /Font << /F1 5 0 R >> >> /Contents %d 0 R >>' "$1"
+        }
+        # The text is written as hex strings, "Needle in a PDF" on page 1 and
+        # "Second page" on page 2, so the words are not in the file itself.
+        pdf doc.pdf \
+          '<< /Type /Catalog /Pages 2 0 R >>' \
+          '<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>' \
+          "$(page 6)" \
+          "$(page 7)" \
+          '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>' \
+          "$(stream 'BT /F1 24 Tf 20 40 Td <4E6565646C6520696E206120504446> Tj ET')" \
+          "$(stream 'BT /F1 24 Tf 20 40 Td <5365636F6E642070616765> Tj ET')"
+        if ugrep -q 'Needle in a PDF' doc.pdf; then
+          echo "found the text without pdftotext" >&2
+          exit 1
+        fi
+        check "$(ugrep --filter='pdf:pdftotext % -' -c 'Needle in a PDF' doc.pdf)" 1
+        check "$(ugrep+ -c 'Second page' doc.pdf)" 1
+        mkdir -p reports/2026
+        cp doc.pdf reports/2026/q3.pdf
+        printf 'Notes on the second page\n' > reports/notes.txt
+        ug+ -rli 'second page' reports | LC_ALL=C sort > found.txt
+        printf 'reports/2026/q3.pdf\nreports/notes.txt\n' > expected.txt
+        cmp expected.txt found.txt || { cat found.txt >&2; exit 1; }
